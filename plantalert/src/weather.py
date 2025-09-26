@@ -5,11 +5,12 @@ from __future__ import annotations
 import logging
 from configparser import ConfigParser
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import List, Optional, Sequence
 
 from meteofrance_api.client import MeteoFranceClient
+from meteofrance_api.model.place import Place
 from zoneinfo import ZoneInfo
 
 LOGGER = logging.getLogger(__name__)
@@ -44,7 +45,7 @@ class MeteoFranceWeatherClient:
         self.freeze_threshold = freeze_threshold
         self.forecast_hours = forecast_hours
         self._client = client or MeteoFranceClient()
-        self._place: Optional[dict] = None
+        self._place: Optional[Place] = None
 
     @classmethod
     def from_config(cls, config_path: Path | str) -> "MeteoFranceWeatherClient":
@@ -65,12 +66,12 @@ class MeteoFranceWeatherClient:
             forecast_hours=forecast_hours,
         )
 
-    def _resolve_place(self) -> dict:
+    def _resolve_place(self) -> Place:
         if self._place is not None:
             return self._place
 
         LOGGER.debug("Recherche de la localisation Meteo-France pour %s", self.city)
-        places: Sequence[dict] = self._client.search_places(self.city)
+        places: Sequence[Place] = self._client.search_places(self.city)
         if not places:
             raise RuntimeError(f"Localisation introuvable pour {self.city}")
 
@@ -81,18 +82,30 @@ class MeteoFranceWeatherClient:
         """Retourne la prévision horaire utile pour la détection de périodes froides."""
 
         place = self._resolve_place()
-        LOGGER.debug("Récupération des prévisions pour %s", place.get("name", self.city))
-        forecast = self._client.get_forecast_for_place(place)
-        hourly_entries = getattr(forecast, "forecast", [])
+        place_name = getattr(place, "name", self.city)
+        LOGGER.debug("Récupération des prévisions pour %s", place_name)
 
-        now_utc = datetime.now(tz=UTC)
+        forecast = self._client.get_forecast_for_place(place)
+        hourly_entries = getattr(forecast, "hourly_forecast", None)
+        if hourly_entries is None:
+            hourly_entries = getattr(forecast, "forecast", [])
+
+        now_utc = datetime.now(tz=timezone.utc)
         horizon = now_utc + timedelta(hours=self.forecast_hours)
 
         results: List[HourlyTemperature] = []
         for entry in hourly_entries:
-            timestamp = entry.get("dt") or entry.get("time")
-            temperature_obj = entry.get("T")
-            if isinstance(temperature_obj, dict):
+            timestamp = getattr(entry, "dt", None)
+            if timestamp is None and isinstance(entry, dict):
+                timestamp = entry.get("dt") or entry.get("time")
+
+            temperature_obj = getattr(entry, "T", None)
+            if temperature_obj is None and isinstance(entry, dict):
+                temperature_obj = entry.get("T")
+
+            if hasattr(temperature_obj, "value"):
+                temperature = getattr(temperature_obj, "value")
+            elif isinstance(temperature_obj, dict):
                 temperature = temperature_obj.get("value")
             else:
                 temperature = temperature_obj
@@ -100,7 +113,7 @@ class MeteoFranceWeatherClient:
             if timestamp is None or temperature is None:
                 continue
 
-            dt_utc = datetime.fromtimestamp(int(timestamp), tz=UTC)
+            dt_utc = datetime.fromtimestamp(int(timestamp), tz=timezone.utc)
             if dt_utc > horizon:
                 break
 
